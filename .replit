@@ -2,6 +2,30 @@ modules = ["python-3.12"]
 
 [nix]
 channel = "stable-25_05"
+packages = ["xcodebuild", "zlib"]
 
 [agent]
 expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Run Scraper"
+
+[[workflows.workflow]]
+name = "Run Scraper"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python main.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
