@@ -1,30 +1,44 @@
-import requests
-import time
-import json
-import os
-import csv
-from urllib.parse import urljoin
-from datetime import date, datetime, timedelta
-from bs4 import BeautifulSoup
-import logging
-import re
-from collections import defaultdict
+"""
+Kruss Real Estate Scraper
+─────────────────────────
+Scrapes property listings from kruss.co.ke, filters by quarter, and saves
+quarterly CSV files with auto-save after every page and full resume support.
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+Run:  python main.py
+"""
+
+import csv
+import html
+import json
+import logging
+import os
+import re
+import threading
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 Base_URL      = "https://kruss.co.ke"
 Search_URL    = f"{Base_URL}/property-status/for-sale/"
-Request_Delay = 0.5   # seconds between requests
+Request_Delay = 0.4          # seconds between requests per thread
+MAX_WORKERS   = 5            # concurrent detail-page fetches
 
-STATE_FILE    = "scraper_state.json"   # tracks resume position + scraped URLs
-OUTPUT_DIR    = "output"               # folder for all CSV files
+STATE_FILE = "scraper_state.json"
+OUTPUT_DIR = "output"
 
 KENYA_COUNTIES = [
     "Nairobi", "Mombasa", "Kisumu", "Nakuru", "Uasin Gishu", "Kiambu",
@@ -54,13 +68,22 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-session = requests.Session()
-session.headers.update(HEADERS)
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# ── Thread-local HTTP sessions (one per worker thread) ────────────────────────
+_thread_local = threading.local()
 
-# ── Quarter helpers ──────────────────────────────────────────────────────────
+
+def get_session() -> requests.Session:
+    """Return a per-thread requests.Session, creating it if needed."""
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        _thread_local.session = s
+    return _thread_local.session
+
+
+# ── Quarter helpers ───────────────────────────────────────────────────────────
 QUARTER_LABELS = {
     1: "Q1 (Jan – Mar)",
     2: "Q2 (Apr – Jun)",
@@ -79,10 +102,11 @@ QUARTER_MONTHS = {
 def quarter_date_range(year: int, quarter: int) -> tuple[date, date]:
     start_month, end_month = QUARTER_MONTHS[quarter]
     date_from = date(year, start_month, 1)
-    if end_month == 12:
-        date_to = date(year, 12, 31)
-    else:
-        date_to = date(year, end_month + 1, 1) - timedelta(days=1)
+    date_to   = (
+        date(year, 12, 31)
+        if end_month == 12
+        else date(year, end_month + 1, 1) - timedelta(days=1)
+    )
     return date_from, date_to
 
 
@@ -90,7 +114,7 @@ def csv_filename(year: int, quarter: int) -> str:
     return os.path.join(OUTPUT_DIR, f"kruss_Q{quarter}_{year}.csv")
 
 
-# ── State (resume) management ─────────────────────────────────────────────────
+# ── State / resume management ─────────────────────────────────────────────────
 def load_state() -> dict | None:
     if os.path.exists(STATE_FILE):
         try:
@@ -107,14 +131,12 @@ def save_state(state: dict) -> None:
 
 
 def load_scraped_urls_from_csv(filepath: str) -> set[str]:
-    """Return the set of URLs already saved in a CSV file."""
     urls: set[str] = set()
     if not os.path.exists(filepath):
         return urls
     try:
         with open(filepath, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+            for row in csv.DictReader(f):
                 if row.get("URL"):
                     urls.add(row["URL"])
     except IOError:
@@ -123,46 +145,42 @@ def load_scraped_urls_from_csv(filepath: str) -> set[str]:
 
 
 def ensure_csv_header(filepath: str) -> None:
-    """Write CSV header if the file doesn't exist yet."""
     if not os.path.exists(filepath):
         with open(filepath, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
-            writer.writeheader()
+            csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS).writeheader()
 
 
 def append_records_to_csv(records: list[dict], filepath: str) -> None:
-    """Append rows to an existing CSV (header must already exist)."""
     if not records:
         return
     with open(filepath, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        w = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
         for r in records:
-            writer.writerow({col: r.get(col, "") for col in OUTPUT_COLUMNS})
-    log.info(f"  Auto-saved {len(records)} record(s) → {filepath}")
+            w.writerow({col: r.get(col, "") for col in OUTPUT_COLUMNS})
+    log.info(f"  💾 Auto-saved {len(records)} record(s) → {filepath}")
 
 
-# ── Quarter / session selection ───────────────────────────────────────────────
+# ── Session / quarter selection prompt ────────────────────────────────────────
 def prompt_session_choice() -> tuple[int, int, int]:
-    """
-    Asks the user whether to resume the last session or start a new one.
-    Returns (year, quarter, start_page).
-    """
+    """Return (year, quarter, start_page)."""
     state = load_state()
 
     if state:
-        y   = state.get("year",     "?")
-        q   = state.get("quarter",  "?")
+        y   = state.get("year",    "?")
+        q   = state.get("quarter", "?")
         pg  = state.get("last_completed_page", 0)
         lbl = QUARTER_LABELS.get(q, f"Q{q}")
         print()
         print("=" * 60)
         print("  PREVIOUS SESSION FOUND")
-        print(f"  Year    : {y}")
-        print(f"  Quarter : {lbl}")
+        print(f"  Year                : {y}")
+        print(f"  Quarter             : {lbl}")
         print(f"  Last completed page : {pg}")
         print("=" * 60)
         while True:
-            choice = input("\n  [R] Resume last session   [N] Start new session : ").strip().upper()
+            choice = input(
+                "\n  [R] Resume last session   [N] Start new session : "
+            ).strip().upper()
             if choice in ("R", "N"):
                 break
             print("  Please enter R or N.")
@@ -171,7 +189,6 @@ def prompt_session_choice() -> tuple[int, int, int]:
             log.info(f"Resuming {lbl} {y} from page {pg + 1}")
             return int(y), int(q), int(pg) + 1
 
-    # ── New session: pick year ────────────────────────────────────────────────
     print()
     print("=" * 60)
     print("  NEW SCRAPING SESSION")
@@ -182,13 +199,12 @@ def prompt_session_choice() -> tuple[int, int, int]:
         if raw.isdigit() and 2000 <= int(raw) <= 2100:
             year = int(raw)
             break
-        print("  Please enter a valid 4-digit year between 2000 and 2100.")
+        print("  Please enter a valid 4-digit year (2000 – 2100).")
 
-    # ── Pick quarter ──────────────────────────────────────────────────────────
     print()
     print("  Which quarter would you like to scrape?")
     for num, label in QUARTER_LABELS.items():
-        print(f"    {num} → {label}")
+        print(f"    {num}  →  {label}")
 
     while True:
         raw = input("\n  Enter quarter number (1, 2, 3 or 4) : ").strip()
@@ -201,11 +217,12 @@ def prompt_session_choice() -> tuple[int, int, int]:
     return year, quarter, 1
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+# ── HTTP fetch (thread-safe) ──────────────────────────────────────────────────
 def fetch(url: str, retries: int = 3) -> str | None:
+    sess = get_session()
     for attempt in range(1, retries + 1):
         try:
-            resp = session.get(url, timeout=30)
+            resp = sess.get(url, timeout=30)
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding
             time.sleep(Request_Delay)
@@ -213,18 +230,18 @@ def fetch(url: str, retries: int = 3) -> str | None:
 
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
-            log.warning(f"HTTP {status} fetching {url} (attempt {attempt}/{retries})")
+            log.warning(f"HTTP {status} on {url} (attempt {attempt}/{retries})")
             if status in (403, 404, 410):
-                return None
+                return None  # permanent – don't retry
 
         except requests.RequestException as e:
-            log.warning(f"Request error: {e} (attempt {attempt}/{retries})")
+            log.warning(f"Request error on {url}: {e} (attempt {attempt}/{retries})")
 
         time.sleep(2 * attempt)
     return None
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── County matching ───────────────────────────────────────────────────────────
 def match_county(*texts: str) -> str:
     combined = " ".join(t for t in texts if t).lower()
     for county in KENYA_COUNTIES:
@@ -233,33 +250,110 @@ def match_county(*texts: str) -> str:
     return "Unknown"
 
 
-# ── Search-page badge parsing (Listing_ID / raw-Type / Date) ─────────────────
-ID_PREFIX_RE   = re.compile(r"ID:\s*(.+)",           re.IGNORECASE)
+# ── Type / Category classification ───────────────────────────────────────────
+# Type     → Residential | Land | Commercial
+# Category → Studio | Bungalow | Apartment | Mansionette | Townhouse | Villa |
+#            Land | Office | Retail | Industrial | Warehousing | Social Amenity
+#
+# "house" alone (without townhouse/bungalow/etc.) → Townhouse per user request.
+# Checked from most-specific to least-specific so short keywords don't shadow
+# longer ones (e.g. "townhouse" is checked before bare "house").
+
+CATEGORY_KEYWORDS: list[tuple[str, str, str]] = [
+    # ── Residential ──────────────────────────────────────────────────────────
+    (r"\bstudios?\b",                                          "Residential", "Studio"),
+    (r"\bbungalows?\b",                                        "Residential", "Bungalow"),
+    (r"\bmansionettes?\b",                                     "Residential", "Mansionette"),
+    (r"\btown[\s-]?houses?\b",                                 "Residential", "Townhouse"),
+    (r"\bvillas?\b",                                           "Residential", "Villa"),
+    (r"\b(apartments?|flats?)\b",                              "Residential", "Apartment"),
+    (r"\bhouses?\b",                                           "Residential", "Townhouse"),  # user: "House" → Townhouse
+    # ── Commercial ───────────────────────────────────────────────────────────
+    (r"\boffices?\b",                                          "Commercial",  "Office"),
+    (r"\bretail\b|\bshops?\b",                                 "Commercial",  "Retail"),
+    (r"\bindustrial\b",                                        "Commercial",  "Industrial"),
+    (r"\bwarehous\w*\b",                                       "Commercial",  "Warehousing"),
+    (r"\b(social\s+amenity|school|hospital|church|clinic)\b",  "Commercial",  "Social Amenity"),
+    # ── Land ─────────────────────────────────────────────────────────────────
+    (r"\b(land|plots?|acres?|hectares?)\b",                    "Land",        "Land"),
+]
+
+# Pre-compile for speed
+_COMPILED_KEYWORDS = [
+    (re.compile(pat, re.IGNORECASE), t, c)
+    for pat, t, c in CATEGORY_KEYWORDS
+]
+
+
+def classify_property(name: str, raw_type_hint: str = "") -> tuple[str, str]:
+    """
+    Return (Type, Category) from listing name and optional raw site-badge hint.
+    First match wins; most-specific patterns are listed first.
+    """
+    combined = f"{name} {raw_type_hint}"
+    for pat, prop_type, category in _COMPILED_KEYWORDS:
+        if pat.search(combined):
+            return prop_type, category
+    log.warning(f"Unclassified property – name={name!r} hint={raw_type_hint!r}")
+    return "", ""
+
+
+def is_land_type(name: str, raw_type_hint: str) -> bool:
+    """Quick check used to route area-size labels before Type is fully classified."""
+    combined = f"{name} {raw_type_hint}".lower()
+    return bool(re.search(r"\b(land|plots?|acres?|hectares?)\b", combined))
+
+
+# ── Search-page badge parsing ─────────────────────────────────────────────────
+# The site uses `property-breadcrumbs` spans.  On the current theme there are
+# FIVE spans per card:
+#   "Property ID :"  |  "LS219"  |  ""  |  "Land/Plots"  |  "Last updated: …"
+# (The ID is split across a label span and a value span.)
+# We accept any ancestor whose badge count is in VALID_BADGE_COUNTS so the
+# parser stays correct even if the site ever changes to 3-badge layout.
+
+VALID_BADGE_COUNTS = frozenset(range(3, 11))   # 3–10 badges; handles layout variants
+
+ID_PREFIX_RE   = re.compile(r"\bID\s*:\s*(.+)",       re.IGNORECASE)
 ID_FORMAT_RE   = re.compile(r"^[A-Za-z]{1,4}\d+[A-Za-z0-9-]*$")
-DATE_PREFIX_RE = re.compile(r"Last updated:\s*(.+)", re.IGNORECASE)
+DATE_PREFIX_RE = re.compile(r"Last\s+updated\s*:\s*(.+)", re.IGNORECASE)
 DATE_FORMAT_RE = re.compile(r"^[A-Za-z]+ \d{1,2},?\s*\d{4}$")
+# Label-only fragments to skip (they contain no useful value)
+LABEL_ONLY_RE  = re.compile(r"^(Property\s+)?ID\s*:?\s*$", re.IGNORECASE)
 
 
-def find_card_badges(name_tag, expected_count: int = 3) -> list:
+def find_card_badges(name_tag) -> list:
+    """
+    Walk up the DOM from a listing title tag and return the badge spans
+    belonging to that single card (the tightest ancestor whose badge count
+    is in VALID_BADGE_COUNTS).
+    """
     for ancestor in name_tag.parents:
         found = ancestor.find_all("span", class_="property-breadcrumbs")
-        if len(found) == expected_count:
+        n = len(found)
+        if n in VALID_BADGE_COUNTS:
             return found
-        if len(found) > expected_count:
-            break
+        if n > max(VALID_BADGE_COUNTS):
+            break   # crossed into a multi-card wrapper (12+ badges = multiple cards)
     return []
 
 
 def classify_badge(text: str) -> tuple[str, str]:
-    id_match = ID_PREFIX_RE.search(text)
-    if id_match:
-        return "Listing_ID", id_match.group(1).strip()
+    """Return (field_name, value) for one badge's text content."""
+    # Skip pure label fragments like "Property ID :"
+    if LABEL_ONLY_RE.match(text):
+        return "", ""
+
+    m = ID_PREFIX_RE.search(text)
+    if m and m.group(1).strip():
+        return "Listing_ID", m.group(1).strip()
+
     if ID_FORMAT_RE.match(text):
         return "Listing_ID", text
 
-    date_match = DATE_PREFIX_RE.search(text)
-    if date_match:
-        return "Date", date_match.group(1).strip()
+    m = DATE_PREFIX_RE.search(text)
+    if m:
+        return "Date", m.group(1).strip()
     if DATE_FORMAT_RE.match(text):
         return "Date", text
 
@@ -267,28 +361,48 @@ def classify_badge(text: str) -> tuple[str, str]:
 
 
 def extract_card_fields(name_tag) -> dict:
+    """
+    Return {"Listing_ID": …, "raw_type": …, "Date": …} for one listing card.
+    Fields are set first-wins per field (except raw_type uses last-wins so that
+    a label fragment like "Property ID :" is replaced by the actual type badge).
+    """
     fields = {"Listing_ID": "", "raw_type": "", "Date": ""}
     title  = name_tag.get_text(strip=True) if name_tag else "<unknown>"
     try:
         badges = find_card_badges(name_tag)
         if not badges:
-            log.warning(f"No badge boundary for {title!r}")
+            log.warning(f"No card boundary found for {title!r} — ID/Type/Date left blank.")
             return fields
+
+        raw_type_candidates: list[str] = []
         for badge in badges:
             text = badge.get_text(" ", strip=True)
             if not text:
                 continue
             field, value = classify_badge(text)
-            fields[field] = value
+            if not field or not value:
+                continue
+            if field == "raw_type":
+                raw_type_candidates.append(value)
+            elif not fields[field]:          # first-wins for ID and Date
+                fields[field] = value
+
+        # Pick the best raw_type: prefer entries that don't look like ID labels
+        for candidate in raw_type_candidates:
+            if not LABEL_ONLY_RE.match(candidate):
+                fields["raw_type"] = candidate
+                break
+
     except Exception:
-        log.exception(f"Badge error for {title!r}")
+        log.exception(f"Badge parse error for {title!r}")
     return fields
 
 
+# ── Date helpers ──────────────────────────────────────────────────────────────
 def parse_kruss_date(text: str) -> date | None:
     if not text:
         return None
-    for fmt in ("%B %d, %Y", "%B %d %Y"):
+    for fmt in ("%B %d, %Y", "%B %d %Y", "%B %d,%Y"):
         try:
             return datetime.strptime(text.strip(), fmt).date()
         except ValueError:
@@ -300,54 +414,12 @@ DETAIL_DATE_RE = re.compile(r"^[A-Za-z]+ \d{1,2},?\s*\d{4}$")
 
 
 def find_detail_page_date(soup: BeautifulSoup) -> str:
+    """Fallback: scan span elements for a bare date string."""
     for span in soup.find_all("span"):
         text = span.get_text(strip=True)
         if text and DETAIL_DATE_RE.match(text):
             return text
     return ""
-
-
-# ── Type / Category classification ───────────────────────────────────────────
-# Type   → Residential | Land | Commercial
-# Category → Studio | Bungalow | Apartment | Mansionette | Townhouse | Villa |
-#            House | Land | Office | Retail | Industrial | Warehousing | Social Amenity
-#
-# "House" (incl. bare "house" matches) → Townhouse per user request
-
-CATEGORY_KEYWORDS = [
-    # ── Residential ──────────────────────────────────────────────────────────
-    (r"\bstudios?\b",                                 "Residential",  "Studio"),
-    (r"\bbungalows?\b",                               "Residential",  "Bungalow"),
-    (r"\bmansionettes?\b",                            "Residential",  "Mansionette"),
-    (r"\btown[\s-]?houses?\b",                        "Residential",  "Townhouse"),
-    (r"\bvillas?\b",                                  "Residential",  "Villa"),
-    (r"\b(apartments?|flats?)\b",                     "Residential",  "Apartment"),
-    # "house" alone → Townhouse as requested
-    (r"\bhouses?\b",                                  "Residential",  "Townhouse"),
-    # ── Commercial ───────────────────────────────────────────────────────────
-    (r"\boffices?\b",                                 "Commercial",   "Office"),
-    (r"\bretail\b|\bshops?\b",                        "Commercial",   "Retail"),
-    (r"\bindustrial\b",                               "Commercial",   "Industrial"),
-    (r"\bwarehous\w*\b",                              "Commercial",   "Warehousing"),
-    (r"\b(social\s+amenity|school|hospital|church|clinic)\b",
-                                                      "Commercial",   "Social Amenity"),
-    # ── Land ─────────────────────────────────────────────────────────────────
-    (r"\b(land|plots?|acres?|hectares?)\b",           "Land",         "Land"),
-]
-
-
-def classify_property(name: str, raw_type_hint: str = "") -> tuple[str, str]:
-    """
-    Returns (Type, Category).
-    Type is one of: Residential | Land | Commercial
-    Category is the specific sub-type.
-    """
-    combined = f"{name} {raw_type_hint}".lower()
-    for pattern, prop_type, category in CATEGORY_KEYWORDS:
-        if re.search(pattern, combined, re.IGNORECASE):
-            return prop_type, category
-    log.warning(f"Unclassified property: name={name!r} hint={raw_type_hint!r}")
-    return "", ""
 
 
 # ── JSON-LD extraction ────────────────────────────────────────────────────────
@@ -374,29 +446,34 @@ def extract_json_ld_listing(soup: BeautifulSoup) -> dict | None:
 
 
 def apply_json_ld(soup: BeautifulSoup, record: dict) -> None:
+    """Fill Name / Price / Location / County from JSON-LD structured data."""
     listing = extract_json_ld_listing(soup)
     if not listing:
         log.warning("No RealEstateListing JSON-LD found")
         return
 
-    record["Name"] = listing.get("name", "") or ""
+    # Decode HTML entities that sometimes appear inside JSON-LD strings
+    raw_name = listing.get("name", "") or ""
+    record["Name"] = html.unescape(raw_name)
 
     offers = listing.get("offers", {})
     if isinstance(offers, list):
         offers = offers[0] if offers else {}
-    record["Price"] = offers.get("price", "") if isinstance(offers, dict) else ""
+    record["Price"] = (
+        str(offers.get("price", "")) if isinstance(offers, dict) else ""
+    )
 
     address = listing.get("address", {})
     if isinstance(address, list):
         address = address[0] if address else {}
-    street = address.get("streetAddress", "") if isinstance(address, dict) else ""
+    street   = address.get("streetAddress", "") if isinstance(address, dict) else ""
     locality = address.get("addressLocality", "") if isinstance(address, dict) else ""
     record["Location"] = locality or street
     record["County"]   = match_county(street, locality)
 
 
-# ── Meta-card row ─────────────────────────────────────────────────────────────
-META_LABEL_MAP = {
+# ── Meta-card row (Bedrooms / Bathrooms / Area / etc.) ───────────────────────
+META_LABEL_MAP: dict[str, str] = {
     "bedrooms":     "No. of Bedrooms",
     "bathrooms":    "No. of Bathrooms",
     "garage":       "Parking",
@@ -408,10 +485,15 @@ META_LABEL_MAP = {
     "floor number": "Floor_Number",
     "floor":        "Floor_Number",
 }
-AREA_LABELS = {"lot size", "floor size", "area size", "size"}
+AREA_LABELS: frozenset[str] = frozenset({"lot size", "floor size", "area size", "size"})
 
 
-def apply_meta_cards(soup: BeautifulSoup, record: dict) -> None:
+def apply_meta_cards(soup: BeautifulSoup, record: dict, is_land: bool) -> None:
+    """
+    Parse the meta-card row.
+    `is_land` is passed in (derived from name + raw_type_hint) so that area
+    labels are routed to the correct column even before Type is classified.
+    """
     for meta in soup.find_all("div", class_="rh_ultra_prop_card__meta"):
         label_tag = meta.find("span", class_="rh-ultra-meta-label")
         if not label_tag:
@@ -428,8 +510,7 @@ def apply_meta_cards(soup: BeautifulSoup, record: dict) -> None:
             continue
 
         if label_lower in AREA_LABELS:
-            prop_type = (record.get("Type") or "").lower()
-            if "land" in prop_type or "plot" in prop_type:
+            if is_land:
                 record["Land_Size"] = value
             else:
                 record["Floor_area_sqm"] = value
@@ -440,30 +521,36 @@ def apply_meta_cards(soup: BeautifulSoup, record: dict) -> None:
             record[mapped] = value
 
 
-# ── Features / amenities ──────────────────────────────────────────────────────
-FEATURE_FLAG_PATTERNS = {
-    "Elevator": r"elevator|\blift\b",
-    "DSQ":      r"\bdsq\b|servant|domestic\s+staff",
-    "Parking":  r"\bparking\b",
+# ── Features / amenities list ─────────────────────────────────────────────────
+FEATURE_FLAG_PATTERNS: dict[str, re.Pattern] = {
+    "Elevator": re.compile(r"elevator|\blift\b",             re.IGNORECASE),
+    "DSQ":      re.compile(r"\bdsq\b|servant|domestic\s+staff", re.IGNORECASE),
+    "Parking":  re.compile(r"\bparking\b",                   re.IGNORECASE),
 }
 
 
 def apply_features(soup: BeautifulSoup, record: dict) -> None:
     feature_texts = [
         a.get_text(strip=True)
-        for a in soup.select("ul.rh_property__features li.rh_property__feature a")
+        for a in soup.select(
+            "ul.rh_property__features li.rh_property__feature a"
+        )
     ]
-    for field, pattern in FEATURE_FLAG_PATTERNS.items():
+    for field, pat in FEATURE_FLAG_PATTERNS.items():
         if record.get(field):
-            continue
+            continue   # already filled (e.g. Parking from meta-card)
         for text in feature_texts:
-            if re.search(pattern, text, re.IGNORECASE):
+            if pat.search(text):
                 record[field] = "Yes"
                 break
 
 
-# ── Search page: collect listing summaries ────────────────────────────────────
+# ── Search page ───────────────────────────────────────────────────────────────
 def get_listing_summaries_from_page(page_num: int) -> list[dict]:
+    """
+    Returns one dict per card: URL, Listing_ID, raw_type, Date.
+    Uses the main thread's session (search pages are fetched sequentially).
+    """
     url  = Search_URL if page_num == 1 else f"{Search_URL}page/{page_num}/"
     body = fetch(url)
     if not body:
@@ -475,30 +562,31 @@ def get_listing_summaries_from_page(page_num: int) -> list[dict]:
         log.exception(f"HTML parse failed for search page {page_num}")
         return []
 
-    names     = soup.find_all("h3", class_="rh-ultra-property-title")
     summaries = []
-    for name_tag in names:
+    for name_tag in soup.find_all("h3", class_="rh-ultra-property-title"):
         a = name_tag.find("a")
         if not a or not a.get("href"):
             continue
         card = extract_card_fields(name_tag)
-        summaries.append({
-            "URL":        urljoin(Base_URL, a["href"]),
-            "Listing_ID": card["Listing_ID"],
-            "raw_type":   card["raw_type"],
-            "Date":       card["Date"],
-        })
+        summaries.append(
+            {
+                "URL":        urljoin(Base_URL, a["href"]),
+                "Listing_ID": card["Listing_ID"],
+                "raw_type":   card["raw_type"],
+                "Date":       card["Date"],
+            }
+        )
 
     log.info(f"  Page {page_num}: {len(summaries)} listings found")
     return summaries
 
 
-# ── Detail page scraper ───────────────────────────────────────────────────────
-def scrape_property(url: str, summary: dict) -> dict:
-    record        = {col: "" for col in OUTPUT_COLUMNS}
-    record["URL"] = url
-
-    # Carry over fields from the search-page summary
+# ── Detail-page scraper ───────────────────────────────────────────────────────
+def scrape_property(summary: dict) -> dict:
+    """Fetch and parse one listing detail page. Safe to call from any thread."""
+    url    = summary["URL"]
+    record = {col: "" for col in OUTPUT_COLUMNS}
+    record["URL"]        = url
     record["Listing_ID"] = summary.get("Listing_ID", "")
     record["Date"]       = summary.get("Date", "")
     raw_type_hint        = summary.get("raw_type", "")
@@ -514,31 +602,39 @@ def scrape_property(url: str, summary: dict) -> dict:
         log.exception(f"HTML parse failed: {url}")
         return record
 
+    # ── JSON-LD: Name / Price / Location / County ─────────────────────────────
     try:
         apply_json_ld(soup, record)
     except Exception:
         log.exception(f"JSON-LD failed: {url}")
 
+    # ── Determine land type early so area labels route correctly ──────────────
+    is_land = is_land_type(record.get("Name", ""), raw_type_hint)
+
+    # ── Meta-cards: Bedrooms / Bathrooms / Area / etc. ───────────────────────
     try:
-        apply_meta_cards(soup, record)
+        apply_meta_cards(soup, record, is_land=is_land)
     except Exception:
         log.exception(f"Meta-card failed: {url}")
 
+    # ── Feature list: Elevator / DSQ / Parking ───────────────────────────────
     try:
         apply_features(soup, record)
     except Exception:
         log.exception(f"Features failed: {url}")
 
-    # Date fallback
+    # ── Date fallback ─────────────────────────────────────────────────────────
     if not record.get("Date"):
         try:
             record["Date"] = find_detail_page_date(soup)
         except Exception:
             pass
 
-    # Type + Category classification
+    # ── Type + Category ───────────────────────────────────────────────────────
     try:
-        prop_type, category = classify_property(record.get("Name", ""), raw_type_hint)
+        prop_type, category = classify_property(
+            record.get("Name", ""), raw_type_hint
+        )
         record["Type"]     = prop_type
         record["Category"] = category
     except Exception:
@@ -547,21 +643,77 @@ def scrape_property(url: str, summary: dict) -> dict:
     return record
 
 
-# ── Main scraping loop ────────────────────────────────────────────────────────
+# ── Concurrent page scraper ───────────────────────────────────────────────────
+def scrape_page_concurrent(
+    summaries: list[dict],
+    already_scraped: set[str],
+    date_from: date,
+    date_to: date,
+) -> list[dict]:
+    """
+    Scrape all eligible listings on a page using a thread pool.
+    Returns records in the same order as the input summaries.
+    """
+    # Filter to only the listings we actually need to fetch
+    to_fetch: list[dict] = []
+    skipped = 0
+
+    for summary in summaries:
+        url = summary["URL"]
+
+        if url in already_scraped:
+            skipped += 1
+            continue
+
+        listing_date = parse_kruss_date(summary.get("Date", ""))
+        if listing_date and not (date_from <= listing_date <= date_to):
+            continue   # out of date range — skip silently
+        if not listing_date:
+            log.warning(f"  No parseable date for {url} — including anyway.")
+
+        to_fetch.append(summary)
+
+    if skipped:
+        log.info(f"  Skipped {skipped} already-scraped listing(s) on this page.")
+
+    if not to_fetch:
+        return []
+
+    # Submit all detail fetches concurrently, preserve order with a dict
+    results: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_idx = {
+            executor.submit(scrape_property, summary): idx
+            for idx, summary in enumerate(to_fetch)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception:
+                log.exception(f"Worker error for {to_fetch[idx]['URL']}")
+
+    # Return records in original order
+    return [results[i] for i in sorted(results)]
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
 def run_scraper() -> None:
-    # ── 1. Session / quarter selection ───────────────────────────────────────
+
+    # ── 1. Session choice ─────────────────────────────────────────────────────
     year, quarter, start_page = prompt_session_choice()
 
     date_from, date_to = quarter_date_range(year, quarter)
-    lbl                = QUARTER_LABELS[quarter]
-    output_csv         = csv_filename(year, quarter)
+    lbl        = QUARTER_LABELS[quarter]
+    output_csv = csv_filename(year, quarter)
 
     print()
     print("=" * 60)
-    print(f"  Session  : {lbl} {year}")
-    print(f"  Date range: {date_from}  →  {date_to}")
-    print(f"  Output   : {output_csv}")
-    print(f"  Starting at page {start_page}")
+    print(f"  Session    : {lbl} {year}")
+    print(f"  Date range : {date_from}  →  {date_to}")
+    print(f"  Output     : {output_csv}")
+    print(f"  Workers    : {MAX_WORKERS} concurrent detail fetches")
+    print(f"  Start page : {start_page}")
     print("=" * 60)
     print()
 
@@ -569,93 +721,77 @@ def run_scraper() -> None:
     ensure_csv_header(output_csv)
     already_scraped = load_scraped_urls_from_csv(output_csv)
     if already_scraped:
-        log.info(f"  Loaded {len(already_scraped)} already-scraped URLs from {output_csv}")
+        log.info(f"Loaded {len(already_scraped)} already-scraped URL(s) from CSV.")
 
-    # ── 3. Initialise / update state ──────────────────────────────────────────
-    state = {
-        "year":                 year,
-        "quarter":              quarter,
-        "last_completed_page":  start_page - 1,
+    # ── 3. Initialise state ───────────────────────────────────────────────────
+    state: dict = {
+        "year":                year,
+        "quarter":             quarter,
+        "last_completed_page": start_page - 1,
     }
     save_state(state)
 
-    # ── 4. Page-by-page loop ──────────────────────────────────────────────────
-    page_num         = start_page
-    total_saved      = len(already_scraped)
-    total_skipped    = 0
+    # ── 4. Page loop ──────────────────────────────────────────────────────────
+    page_num          = start_page
+    total_new         = 0
     consecutive_empty = 0
+    run_start         = time.time()
 
     while True:
-        log.info(f"Fetching page {page_num} …")
+        log.info(f"─── Page {page_num} ─────────────────────────────────────────")
         summaries = get_listing_summaries_from_page(page_num)
 
         if not summaries:
             consecutive_empty += 1
             if consecutive_empty >= 2:
-                log.info("Two consecutive empty pages — reached the end of results.")
+                log.info("Two consecutive empty pages — end of results reached.")
                 break
             page_num += 1
             continue
 
         consecutive_empty = 0
-        page_records      = []
 
-        for summary in summaries:
-            url = summary["URL"]
+        # ── Concurrent detail-page fetches ────────────────────────────────────
+        page_records = scrape_page_concurrent(
+            summaries, already_scraped, date_from, date_to
+        )
 
-            # ── Skip already-scraped listings ─────────────────────────────────
-            if url in already_scraped:
-                log.info(f"  Skipping (already scraped): {url}")
-                total_skipped += 1
-                continue
+        # ── Log each result ───────────────────────────────────────────────────
+        for r in page_records:
+            already_scraped.add(r["URL"])
+            log.info(
+                f"  ✓ {r.get('Listing_ID','?'):15s} | "
+                f"{r.get('Type','?'):13s} › {r.get('Category','?'):15s} | "
+                f"{r.get('Name','?')[:50]}"
+            )
 
-            # ── Date filter ───────────────────────────────────────────────────
-            listing_date = parse_kruss_date(summary["Date"])
-            if listing_date and not (date_from <= listing_date <= date_to):
-                log.info(f"  Out of range ({listing_date}): {url}")
-                continue
-            if not listing_date:
-                log.warning(f"  No parseable date for {url} — including anyway.")
-
-            # ── Scrape detail page ────────────────────────────────────────────
-            try:
-                record = scrape_property(url, summary)
-                already_scraped.add(url)
-                page_records.append(record)
-                log.info(
-                    f"  ✓ {record.get('Listing_ID','?')} | "
-                    f"{record.get('Name','?')} | "
-                    f"{record.get('Type','?')} – {record.get('Category','?')}"
-                )
-            except Exception:
-                log.exception(f"  Unexpected error for {url} — skipping.")
-
-        # ── Auto-save after every page ────────────────────────────────────────
+        # ── Auto-save ─────────────────────────────────────────────────────────
         if page_records:
             append_records_to_csv(page_records, output_csv)
-            total_saved += len(page_records)
-            log.info(
-                f"  Page {page_num} done: {len(page_records)} new record(s) saved "
-                f"({total_saved} total, {total_skipped} skipped)"
-            )
-        else:
-            log.info(f"  Page {page_num}: nothing new to save.")
+            total_new += len(page_records)
 
-        # ── Persist resume state ───────────────────────────────────────────────
+        elapsed = time.time() - run_start
+        log.info(
+            f"  Page {page_num} complete │ {len(page_records)} new │ "
+            f"{total_new} total this run │ {elapsed:.0f}s elapsed"
+        )
+
+        # ── Persist resume state ──────────────────────────────────────────────
         state["last_completed_page"] = page_num
         save_state(state)
 
         page_num += 1
 
-    # ── 5. Summary ────────────────────────────────────────────────────────────
+    # ── 5. Final summary ──────────────────────────────────────────────────────
+    elapsed = time.time() - run_start
     print()
     print("=" * 60)
     print("  SCRAPING COMPLETE")
-    print(f"  Quarter    : {lbl} {year}")
-    print(f"  Output file: {output_csv}")
-    print(f"  Records saved (this run): {total_saved - len(already_scraped) + len(page_records) if page_records else total_saved}")
-    print(f"  Total in file: {total_saved}")
-    print(f"  Listings skipped (already done): {total_skipped}")
+    print(f"  Quarter     : {lbl} {year}")
+    print(f"  Output file : {output_csv}")
+    print(f"  New records : {total_new}")
+    print(f"  Total in file : {len(already_scraped)}")
+    print(f"  Time elapsed : {elapsed:.1f}s")
     print("=" * 60)
 
 
