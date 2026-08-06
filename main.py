@@ -317,7 +317,12 @@ VALID_BADGE_COUNTS = frozenset(range(3, 11))   # 3–10 badges; handles layout v
 ID_PREFIX_RE   = re.compile(r"\bID\s*:\s*(.+)",       re.IGNORECASE)
 ID_FORMAT_RE   = re.compile(r"^[A-Za-z]{1,4}\d+[A-Za-z0-9-]*$")
 DATE_PREFIX_RE = re.compile(r"Last\s+updated\s*:\s*(.+)", re.IGNORECASE)
-DATE_FORMAT_RE = re.compile(r"^[A-Za-z]+ \d{1,2},?\s*\d{4}$")
+# Date formats: month-first ("August 6, 2026", "Aug 6, 2026") or
+# day-first ("6 August, 2026", "6 Aug, 2026").
+_DATE_CORE = r"(?:[A-Za-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+[A-Za-z]+\.?,?\s+\d{4})"
+DATE_FORMAT_RE   = re.compile(rf"^{_DATE_CORE}$")
+DATE_TOKEN_RE    = re.compile(_DATE_CORE)
+LAST_UPDATED_RE  = re.compile(rf"Last\s+updated\s*:?\s*(?P<d>{_DATE_CORE})", re.IGNORECASE)
 # Label-only fragments to skip (they contain no useful value)
 LABEL_ONLY_RE  = re.compile(r"^(Property\s+)?ID\s*:?\s*$", re.IGNORECASE)
 
@@ -360,6 +365,43 @@ def classify_badge(text: str) -> tuple[str, str]:
     return "raw_type", text
 
 
+def fallback_card_fields(name_tag) -> tuple[str, str]:
+    """
+    Best-effort Listing_ID / Date extraction straight from the card block,
+    used when the breadcrumb-badge layout can't be parsed at all.
+
+    A bare date is only trusted when the same block also contains an
+    ID-format token, so dates from neighboring cards or the page footer
+    can't leak into this card and skew the quarter filter.
+    """
+    listing_id, listing_date = "", ""
+    block = name_tag
+    for _ in range(6):
+        block = block.parent
+        if block is None:
+            break
+        text = block.get_text(" ", strip=True)
+        if len(text) > 4000:
+            break                      # wandered outside the card block
+        block_id, block_date = "", ""
+        for token in text.split():
+            if ID_FORMAT_RE.match(token) and len(token) <= 15:
+                block_id = token
+                break
+        m = LAST_UPDATED_RE.search(text)
+        if m:
+            block_date = m.group("d").strip().rstrip(",")
+        elif block_id:                 # bare date only if an ID is here too
+            m = DATE_TOKEN_RE.search(text)
+            if m:
+                block_date = m.group(0).strip().rstrip(",")
+        listing_id = listing_id or block_id
+        listing_date = listing_date or block_date
+        if listing_id and listing_date:
+            break
+    return listing_id, listing_date
+
+
 def extract_card_fields(name_tag) -> dict:
     """
     Return {"Listing_ID": …, "raw_type": …, "Date": …} for one listing card.
@@ -371,7 +413,17 @@ def extract_card_fields(name_tag) -> dict:
     try:
         badges = find_card_badges(name_tag)
         if not badges:
-            log.warning(f"No card boundary found for {title!r} — ID/Type/Date left blank.")
+            # Fallback: scan the card block directly for an ID / date
+            lid, ldate = fallback_card_fields(name_tag)
+            if lid:
+                fields["Listing_ID"] = lid
+            if ldate:
+                fields["Date"] = ldate
+            if not (lid or ldate):
+                log.warning(
+                    f"No card boundary found for {title!r} — "
+                    "ID/Type/Date left blank."
+                )
             return fields
 
         raw_type_candidates: list[str] = []
@@ -402,7 +454,12 @@ def extract_card_fields(name_tag) -> dict:
 def parse_kruss_date(text: str) -> date | None:
     if not text:
         return None
-    for fmt in ("%B %d, %Y", "%B %d %Y", "%B %d,%Y"):
+    for fmt in (
+        "%B %d, %Y", "%B %d %Y", "%B %d,%Y",          # month-first
+        "%d %B, %Y", "%d %B %Y",                      # day-first
+        "%b %d, %Y", "%b %d %Y", "%b. %d, %Y",        # abbreviated month
+        "%d %b, %Y", "%d %b %Y", "%d %b., %Y",
+    ):
         try:
             return datetime.strptime(text.strip(), fmt).date()
         except ValueError:
@@ -410,15 +467,79 @@ def parse_kruss_date(text: str) -> date | None:
     return None
 
 
-DETAIL_DATE_RE = re.compile(r"^[A-Za-z]+ \d{1,2},?\s*\d{4}$")
+def listing_in_range(
+    record: dict, date_from: date | None, date_to: date | None
+) -> bool:
+    """
+    Strict quarter/year check: True only when the listing's date is known
+    and falls inside [date_from, date_to]. Keeps out-of-quarter and undated
+    listings out of the output CSV.
+    """
+    if date_from is None or date_to is None:
+        return True
+    listing_date = parse_kruss_date(record.get("Date", ""))
+    if not listing_date:
+        log.warning(
+            f"  No date found for {record.get('URL', '?')} — excluded "
+            f"(outside {date_from} → {date_to} filter)."
+        )
+        return False
+    if not (date_from <= listing_date <= date_to):
+        log.info(
+            f"  Skipping {record.get('URL', '?')}: dated {listing_date} "
+            f"outside {date_from} → {date_to}."
+        )
+        return False
+    return True
 
 
 def find_detail_page_date(soup: BeautifulSoup) -> str:
-    """Fallback: scan span elements for a bare date string."""
-    for span in soup.find_all("span"):
-        text = span.get_text(strip=True)
-        if text and DETAIL_DATE_RE.match(text):
+    """Fallback: find a 'Last updated' label or a bare date string."""
+    # 1) "Last updated: <date>" – label may be split across elements
+    for string in soup.find_all(string=LAST_UPDATED_RE):
+        parent = string.parent
+        for _ in range(3):
+            if parent is None:
+                break
+            m = LAST_UPDATED_RE.search(parent.get_text(" ", strip=True))
+            if m:
+                return m.group("d").strip().rstrip(",")
+            parent = parent.parent
+    # 2) bare date string inside a small element
+    for tag in soup.find_all(["span", "li", "div", "p"]):
+        text = tag.get_text(strip=True)
+        if text and DATE_FORMAT_RE.match(text):
             return text
+    return ""
+
+
+# ── Listing-ID fallback (detail page) ─────────────────────────────────────────
+def find_detail_page_listing_id(soup: BeautifulSoup) -> str:
+    """Fallback: locate a property/listing ID somewhere on the detail page."""
+    id_label_re = re.compile(
+        r"(?:property|listing|reference|ref)\s*(?:id\s*)?:?", re.IGNORECASE
+    )
+    id_value_re = re.compile(
+        r"(?:property|listing|reference|ref)\s*(?:id\s*)?:?\s*"
+        r"\b([A-Za-z]{1,4}\d+[A-Za-z0-9-]*)\b",
+        re.IGNORECASE,
+    )
+    # 1) Label + value in the same element, or a few levels up
+    for string in soup.find_all(string=id_label_re):
+        parent = string.parent
+        for _ in range(3):
+            if parent is None:
+                break
+            m = id_value_re.search(parent.get_text(" ", strip=True))
+            if m:
+                return m.group(1)
+            parent = parent.parent
+    # 2) Last resort: a bare ID-format token in a small element
+    for tag in soup.find_all(["span", "strong", "b", "li", "td"]):
+        for token in tag.get_text(" ", strip=True).split():
+            token = token.strip(".,;:")
+            if ID_FORMAT_RE.match(token) and len(token) <= 15:
+                return token
     return ""
 
 
@@ -529,7 +650,20 @@ FEATURE_FLAG_PATTERNS: dict[str, re.Pattern] = {
 }
 
 
+def feature_present(value) -> bool:
+    """True when an already-extracted value indicates the feature exists."""
+    if not value:
+        return False
+    return str(value).strip().lower() not in ("0", "no", "none", "-", "n/a")
+
+
 def apply_features(soup: BeautifulSoup, record: dict) -> None:
+    """
+    Binary feature flags: "1" when the feature is present, else "0".
+
+    Sources: the site's feature/amenities list, plus any meta-card value
+    already captured (e.g. Parking from a "Garage: 2" row).
+    """
     feature_texts = [
         a.get_text(strip=True)
         for a in soup.select(
@@ -537,12 +671,13 @@ def apply_features(soup: BeautifulSoup, record: dict) -> None:
         )
     ]
     for field, pat in FEATURE_FLAG_PATTERNS.items():
-        if record.get(field):
-            continue   # already filled (e.g. Parking from meta-card)
-        for text in feature_texts:
-            if pat.search(text):
-                record[field] = "Yes"
-                break
+        present = feature_present(record.get(field))  # e.g. Parking from meta-card
+        if not present:
+            for text in feature_texts:
+                if pat.search(text):
+                    present = True
+                    break
+        record[field] = "1" if present else "0"
 
 
 # ── Search page ───────────────────────────────────────────────────────────────
@@ -582,10 +717,22 @@ def get_listing_summaries_from_page(page_num: int) -> list[dict]:
 
 
 # ── Detail-page scraper ───────────────────────────────────────────────────────
-def scrape_property(summary: dict) -> dict:
-    """Fetch and parse one listing detail page. Safe to call from any thread."""
+def scrape_property(
+    summary: dict,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> dict | None:
+    """
+    Fetch and parse one listing detail page. Safe to call from any thread.
+
+    When date_from/date_to are given the record is validated against the
+    listing's best-known date (card badge, else detail page) and None is
+    returned when it can't be confirmed to fall inside that quarter/year.
+    """
     url    = summary["URL"]
     record = {col: "" for col in OUTPUT_COLUMNS}
+    for f in FEATURE_FLAG_PATTERNS:
+        record[f] = "0"                   # feature flags default to absent (0)
     record["URL"]        = url        # -> URL
     record["Listing_ID"] = summary.get("Listing_ID", "")     # -> Listing ID
     record["Date"]       = summary.get("Date", "")    # -> Date
@@ -594,7 +741,7 @@ def scrape_property(summary: dict) -> dict:
     body = fetch(url)
     if not body:
         log.warning(f"Failed to fetch: {url}")
-        return record
+        return record if listing_in_range(record, date_from, date_to) else None
 
     try:
         soup = BeautifulSoup(body, "lxml")
@@ -630,6 +777,17 @@ def scrape_property(summary: dict) -> dict:
         except Exception:
             pass
 
+    # ── Listing ID fallback ───────────────────────────────────────────────────
+    if not record.get("Listing_ID"):
+        try:
+            record["Listing_ID"] = find_detail_page_listing_id(soup)
+        except Exception:
+            log.exception(f"Listing-ID fallback failed: {url}")
+
+    # ── Strict quarter/year date filter ───────────────────────────────────────
+    if not listing_in_range(record, date_from, date_to):
+        return None
+
     # ── Type + Category ───────────────────────────────────────────────────────
     try:
         prop_type, category = classify_property(
@@ -652,11 +810,16 @@ def scrape_page_concurrent(
 ) -> list[dict]:
     """
     Scrape all eligible listings on a page using a thread pool.
+
+    Strict date filtering: a listing is scraped when its card date already
+    falls inside [date_from, date_to], or – when the card has no date – it
+    is fetched so the detail page can be checked, then dropped if it still
+    can't be confirmed within the chosen quarter/year.
     Returns records in the same order as the input summaries.
     """
-    # Filter to only the listings we actually need to fetch
     to_fetch: list[dict] = []
-    skipped = 0
+    skipped       = 0
+    out_of_range  = 0
 
     for summary in summaries:
         url = summary["URL"]
@@ -666,15 +829,23 @@ def scrape_page_concurrent(
             continue
 
         listing_date = parse_kruss_date(summary.get("Date", ""))
-        if listing_date and not (date_from <= listing_date <= date_to):
-            continue   # out of date range — skip silently
-        if not listing_date:
-            log.warning(f"  No parseable date for {url} — including anyway.")
-
-        to_fetch.append(summary)
+        if listing_date:
+            if date_from <= listing_date <= date_to:
+                to_fetch.append(summary)
+            else:
+                out_of_range += 1   # dated, but outside this quarter/year
+        else:
+            # No card date — scrape_property validates against the detail
+            # page's date and returns None when out of range.
+            to_fetch.append(summary)
 
     if skipped:
         log.info(f"  Skipped {skipped} already-scraped listing(s) on this page.")
+    if out_of_range:
+        log.info(
+            f"  Skipped {out_of_range} listing(s) dated outside "
+            f"{date_from} → {date_to}."
+        )
 
     if not to_fetch:
         return []
@@ -683,7 +854,7 @@ def scrape_page_concurrent(
     results: dict[int, dict] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_idx = {
-            executor.submit(scrape_property, summary): idx
+            executor.submit(scrape_property, summary, date_from, date_to): idx
             for idx, summary in enumerate(to_fetch)
         }
         for future in as_completed(future_to_idx):
@@ -693,8 +864,8 @@ def scrape_page_concurrent(
             except Exception:
                 log.exception(f"Worker error for {to_fetch[idx]['URL']}")
 
-    # Return records in original order
-    return [results[i] for i in sorted(results)]
+    # Return records in original order, dropping out-of-range results (None)
+    return [results[i] for i in sorted(results) if results[i] is not None]
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
