@@ -586,10 +586,10 @@ def scrape_property(summary: dict) -> dict:
     """Fetch and parse one listing detail page. Safe to call from any thread."""
     url    = summary["URL"]
     record = {col: "" for col in OUTPUT_COLUMNS}
-    record["URL"]        = url
-    record["Listing_ID"] = summary.get("Listing_ID", "")
-    record["Date"]       = summary.get("Date", "")
-    raw_type_hint        = summary.get("raw_type", "")
+    record["URL"]        = url        # -> URL
+    record["Listing_ID"] = summary.get("Listing_ID", "")     # -> Listing ID
+    record["Date"]       = summary.get("Date", "")    # -> Date
+    raw_type_hint        = summary.get("raw_type", "")   
 
     body = fetch(url)
     if not body:
@@ -635,8 +635,8 @@ def scrape_property(summary: dict) -> dict:
         prop_type, category = classify_property(
             record.get("Name", ""), raw_type_hint
         )
-        record["Type"]     = prop_type
-        record["Category"] = category
+        record["Type"]     = prop_type     # -> Type
+        record["Category"] = category     # -> Category
     except Exception:
         log.exception(f"Classification failed: {url}")
 
@@ -738,13 +738,13 @@ def run_scraper() -> None:
     run_start         = time.time()
 
     while True:
-        log.info(f"─── Page {page_num} ─────────────────────────────────────────")
+        log.info(f"─── Page {page_num} ────")
         summaries = get_listing_summaries_from_page(page_num)
 
         if not summaries:
             consecutive_empty += 1
-            if consecutive_empty >= 2:
-                log.info("Two consecutive empty pages — end of results reached.")
+            if consecutive_empty >= 4:
+                log.info("end of results.")
                 break
             page_num += 1
             continue
