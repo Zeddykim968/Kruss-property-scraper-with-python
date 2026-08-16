@@ -261,18 +261,18 @@ def match_county(*texts: str) -> str:
 
 CATEGORY_KEYWORDS: list[tuple[str, str, str]] = [
     # ── Residential ──────────────────────────────────────────────────────────
-    (r"\bstudios?\b",                                          "Residential", "Studio"),
-    (r"\bbungalows?\b",                                        "Residential", "Bungalow"),
-    (r"\bmansionettes?\b",                                     "Residential", "Mansionette"),
-    (r"\btown[\s-]?houses?\b",                                 "Residential", "Townhouse"),
-    (r"\bvillas?\b",                                           "Residential", "Villa"),
-    (r"\b(apartments?|flats?)\b",                              "Residential", "Apartment"),
-    (r"\bhouses?\b",                                           "Residential", "Townhouse"),  # user: "House" → Townhouse
+    (r"\bstudio?| Studio?\b",                                          "Residential", "Studio"),
+    (r"\bbungalow?| Bungalow?\b",                                        "Residential", "Bungalow"),
+    (r"\bmansionette?| Mansionette?\b",                                     "Residential", "Mansionette"),
+    (r"\btown[\s-]?house?| Town[\s-]?House?\b",                                 "Residential", "Townhouse"),
+    (r"\bvilla?| Villa?\b",                                           "Residential", "Villa"),
+    (r"\b(apartment?|flat?)\b",                              "Residential", "Apartment"),
+    (r"\bhouse?| House?\b",                                           "Residential", "Townhouse"),  # user: "House" → Townhouse
     # ── Commercial ───────────────────────────────────────────────────────────
-    (r"\boffices?\b",                                          "Commercial",  "Office"),
+    (r"\boffice?\b",                                          "Commercial",  "Office"),
     (r"\bretail\b|\bshops?\b",                                 "Commercial",  "Retail"),
     (r"\bindustrial\b",                                        "Commercial",  "Industrial"),
-    (r"\bwarehous\w*\b",                                       "Commercial",  "Warehousing"),
+    (r"\bwarehouse\w*\b",                                       "Commercial",  "Warehousing"),
     (r"\b(social\s+amenity|school|hospital|church|clinic)\b",  "Commercial",  "Social Amenity"),
     # ── Land ─────────────────────────────────────────────────────────────────
     (r"\b(land|plots?|acres?|hectares?)\b",                    "Land",        "Land"),
